@@ -202,6 +202,8 @@ When switching providers, update `MEDIA_DRIVER`/`S3_*` and promote the rows with
 
 ### 7.3 Render
 
+Render deploys through its GitHub app, not a personal access token. For a private repository, install the app once and give it access to this repo (**Dashboard → Account Settings → GitHub → Configure → Repository access**). Without that grant, service creation fails with `passed in repository URL is invalid or unfetchable` even when the repo exists.
+
 Create a **Web Service** from the repository:
 
 | Setting | Value |
