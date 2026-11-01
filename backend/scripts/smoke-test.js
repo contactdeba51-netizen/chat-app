@@ -9,6 +9,9 @@ const { Client } = require('pg')
 const storage = require('../src/storage')
 
 const BASE = process.env.SMOKE_BASE_URL || 'http://localhost:5000/api'
+// Origin used for the media checks; must match the server under test so a
+// remote deployment can be verified without pointing at localhost.
+const ORIGIN = process.env.SMOKE_ORIGIN || BASE.replace(/\/api$/, '')
 const PASSWORD = 'Password123!'
 const db = new Client({ connectionString: process.env.DATABASE_URL })
 
@@ -214,10 +217,10 @@ async function main() {
     avatarForm.append('avatar', new Blob([pixel], { type: 'image/png' }), 'dot.png')
     const avatarUpload = await request('/users/me/avatar', { method: 'POST', token: aliceToken, form: avatarForm })
     check('avatar upload returns a signed URL', avatarUpload.status === 200 && String(avatarUpload.data.user.avatarUrl).startsWith('/api/media/'), JSON.stringify(avatarUpload.data))
-    const signedUrl = `http://localhost:5000${avatarUpload.data.user.avatarUrl}`
+    const signedUrl = `${ORIGIN}${avatarUpload.data.user.avatarUrl}`
     const signedResponse = await fetch(signedUrl)
     check('signed media is served', signedResponse.status === 200 && String(signedResponse.headers.get('content-type')).includes('image/png'))
-    check('unsigned media path is gone', (await fetch(`http://localhost:5000/uploads/${avatarUpload.data.user.avatarUrl.split('/')[3].split('?')[0]}`)).status === 404)
+    check('unsigned media path is gone', (await fetch(`${ORIGIN}/uploads/${avatarUpload.data.user.avatarUrl.split('/')[3].split('?')[0]}`)).status === 404)
     check('tampered media signature is rejected', (await fetch(signedUrl.replace(/signature=[a-f0-9]+/, 'signature=0'.repeat(64)))).status === 403)
 
     const secondAvatarForm = new FormData()
