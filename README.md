@@ -216,6 +216,8 @@ Create a **Web Service** from the repository:
 | Region | Singapore |
 | Instance type | Free (see 10) |
 
+Set `NODE_VERSION=22.14.0` on both services. Vite 8 builds with rolldown, whose Linux native binding declares `node >= 22.12.0`; on Node 22.11 npm silently skips that optional package and the static build fails with `Cannot find native binding`. A build that dies seconds after `vite build` starts is almost always this version mismatch, not the code.
+
 Use `/healthz` for the Render health check and for any uptime monitor. It returns `200` without touching PostgreSQL, which matters because Neon's free plan bills compute while the database is awake. `/readyz` is the probe that actually queries the database; use it when debugging a deploy, not for frequent pings.
 
 Environment variables:
@@ -248,7 +250,7 @@ TRUST_PROXY_HOPS=1
 
 `TRUST_PROXY_HOPS=1` lets Express read the real client IP from Render's proxy so per-IP limits work. `CLIENT_URL` must be the exact frontend origin, including scheme and no trailing slash.
 
-Deploy the frontend separately (Render Static Site, Vercel, or Netlify) and set its build variables before building:
+Deploy the frontend separately. On a **Render Static Site** use root directory `frontend`, build command `npm ci && npm run build`, and publish directory `dist`. Set its build variables before building:
 
 ```env
 VITE_API_URL=https://your-api.onrender.com/api
