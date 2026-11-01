@@ -1,0 +1,46 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "db:setup": "node scripts/setup-db.js",
+    "db:status": "node scripts/migrate.js status",
+    "db:migrate": "node scripts/migrate.js up",
+    "db:baseline": "node scripts/migrate.js baseline",
+    "db:copy": "node scripts/copy-database.js",
+    "media:backfill": "node scripts/backfill-media.js",
+    "media:verify": "node scripts/verify-media.js",
+    "storage:test": "node scripts/test-storage.js",
+    "smoke": "node scripts/smoke-test.js",
+    "mail:test": "node scripts/test-mail.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1160.0",
+    "@aws-sdk/s3-request-presigner": "^3.1160.0",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "libphonenumber-js": "^1.13.15",
+    "multer": "^2.5.0",
+    "pg": "^8.23.1",
+    "resend": "^6.35.0",
+    "sharp": "^0.35.5",
+    "socket.io": "^4.8.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

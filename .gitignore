@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+
+# Secrets: every env file except the documented template.
+.env
+.env.*
+!.env.example
+
+# Local media and local database backups never belong in Git.
+backend/uploads/
+backups/
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
