@@ -22,6 +22,7 @@ const storage = require('./storage')
 const { signAccessToken, verifyAccessToken, requireAuth, createResetToken, hashToken } = require('./auth')
 const { sendMail, isConfigured: mailConfigured } = require('./mailer')
 const { normalizePhone, formatPhone, isCountryCode } = require('./phone')
+const { jwtSecret, mediaSecret, assertProductionSecrets } = require('./secrets')
 
 const PORT = Number(process.env.PORT) || 5000
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173'
@@ -32,7 +33,10 @@ function corsOrigin(origin, callback) {
   const localPreview = !isProduction && /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin || '')
   return callback(null, !origin || allowedOrigins.has(origin) || localPreview)
 }
-if (!process.env.JWT_SECRET) console.warn('JWT_SECRET is not configured. Sessions will use an insecure development fallback.')
+// A production deployment must not start with a missing, short, or shared
+// secret: those values sign sessions, media links, and chat unlock tokens.
+assertProductionSecrets()
+if (!isProduction && !process.env.JWT_SECRET) console.warn('JWT_SECRET is not configured. Using the development fallback; production requires a real secret.')
 if (!mailConfigured()) console.warn('Email delivery is not configured. Sign-ups and password recovery stay disabled until BREVO_API_KEY and EMAIL_FROM are set.')
 if (isProduction && storage.driverName() === 'local') console.warn('MEDIA_DRIVER is "local". Render disks are ephemeral, so uploaded media will be lost on the next deploy.')
 if (storage.driverName() === 's3' && !storage.s3.isConfigured()) console.warn(`MEDIA_DRIVER=s3 but storage credentials are incomplete (${storage.s3.missingSettings().join(', ')}). Uploads will fail with 503.`)
@@ -60,7 +64,7 @@ fs.mkdirSync(uploadTempDirectory, { recursive: true })
 
 // Media is never served from a public directory. Every stored file gets a
 // short-lived signed URL, so only people who received the link can fetch it.
-const MEDIA_SECRET = process.env.MEDIA_SECRET || process.env.JWT_SECRET || 'chat-app-media-dev-secret'
+const MEDIA_SECRET = mediaSecret()
 const MEDIA_URL_TTL_SECONDS = Number(process.env.MEDIA_URL_TTL_SECONDS) || 7 * 24 * 60 * 60
 const MEDIA_FILE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]{2,5}$/
 
@@ -630,7 +634,7 @@ async function broadcastUserUpdate(userId) {
 }
 
 function hashSignupCode(pendingId, code) {
-  return crypto.createHmac('sha256', process.env.JWT_SECRET || 'chat-app-dev-secret').update(`${pendingId}:${code}`).digest('hex')
+  return crypto.createHmac('sha256', jwtSecret()).update(`${pendingId}:${code}`).digest('hex')
 }
 
 async function issueSignupCode(pending) {
@@ -1203,6 +1207,9 @@ app.delete('/api/messages/:messageId/star', requireAuth, asyncRoute(async (reque
 
 app.post('/api/chats/:chatId/read', requireAuth, asyncRoute(async (request, response) => {
   await ensureChatMember(request.params.chatId, request.auth.sub)
+  // Read receipts are chat content too: a locked chat must not have its
+  // receipts moved without the same unlock token the message routes require.
+  await requireChatAccess(request.params.chatId, request.auth.sub, request.get('x-chat-unlock'))
   await query(`INSERT INTO message_receipts (message_id, user_id, delivered_at, read_at)
     SELECT id, $2, NOW(), NOW() FROM messages WHERE chat_id = $1 AND sender_id <> $2
     ON CONFLICT (message_id, user_id) DO UPDATE SET delivered_at = COALESCE(message_receipts.delivered_at, NOW()), read_at = NOW()`, [request.params.chatId, request.auth.sub])
@@ -1210,15 +1217,28 @@ app.post('/api/chats/:chatId/read', requireAuth, asyncRoute(async (request, resp
   response.status(204).end()
 }))
 
-// Failed PIN attempts are throttled per account and chat, not per IP.
-const unlockAttempts = new Map()
-function allowUnlockAttempt(key) {
-  const now = Date.now()
-  const recent = (unlockAttempts.get(key) || []).filter((time) => time > now - 15 * 60 * 1000)
-  if (recent.length >= 10) { unlockAttempts.set(key, recent); return false }
-  recent.push(now)
-  unlockAttempts.set(key, recent)
-  return true
+// Failed PIN attempts are throttled per account and chat, not per IP. The
+// counter lives in PostgreSQL so a restart or a second instance cannot reset it.
+const UNLOCK_ATTEMPT_LIMIT = 10
+const UNLOCK_ATTEMPT_WINDOW_SECONDS = 15 * 60
+
+// One atomic upsert: the first attempt in a window starts it, later attempts
+// increment it, and an expired window starts over. Returned count includes the
+// attempt being made now, so the limit allows exactly UNLOCK_ATTEMPT_LIMIT tries.
+async function recordUnlockAttempt(userId, chatId) {
+  const { rows } = await query(`INSERT INTO chat_unlock_attempts (user_id, chat_id, window_start, attempts)
+    VALUES ($1, $2, NOW(), 1)
+    ON CONFLICT (user_id, chat_id) DO UPDATE SET
+      attempts = CASE WHEN chat_unlock_attempts.window_start < NOW() - make_interval(secs => $3)
+        THEN 1 ELSE chat_unlock_attempts.attempts + 1 END,
+      window_start = CASE WHEN chat_unlock_attempts.window_start < NOW() - make_interval(secs => $3)
+        THEN NOW() ELSE chat_unlock_attempts.window_start END
+    RETURNING attempts`, [userId, chatId, UNLOCK_ATTEMPT_WINDOW_SECONDS])
+  return Number(rows[0]?.attempts) || 1
+}
+
+async function clearUnlockAttempts(userId, chatId) {
+  await query('DELETE FROM chat_unlock_attempts WHERE user_id = $1 AND chat_id = $2', [userId, chatId])
 }
 
 app.patch('/api/chats/:chatId/preferences', requireAuth, asyncRoute(async (request, response) => {
@@ -1262,12 +1282,14 @@ app.post('/api/chats/:chatId/unlock', requireAuth, asyncRoute(async (request, re
   await ensureChatMember(request.params.chatId, request.auth.sub)
   const state = await chatLockState(request.params.chatId, request.auth.sub)
   if (!state.locked) return response.json({ token: unlockToken(request.params.chatId, request.auth.sub), expiresIn: UNLOCK_TTL_SECONDS })
-  const attemptKey = `${request.auth.sub}:${request.params.chatId}`
-  if (!allowUnlockAttempt(attemptKey)) return response.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' })
+  const attempts = await recordUnlockAttempt(request.auth.sub, request.params.chatId)
+  if (attempts > UNLOCK_ATTEMPT_LIMIT) return response.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' })
   if (!state.lock_pin_hash || !(await bcrypt.compare(pin, state.lock_pin_hash))) {
     return response.status(403).json({ error: 'Incorrect PIN.' })
   }
-  unlockAttempts.delete(attemptKey)
+  // A correct PIN clears the window, so a legitimate unlock does not leave the
+  // account one mistake away from a lockout.
+  await clearUnlockAttempts(request.auth.sub, request.params.chatId)
   response.json({ token: unlockToken(request.params.chatId, request.auth.sub), expiresIn: UNLOCK_TTL_SECONDS })
 }))
 
@@ -1400,16 +1422,18 @@ io.on('connection', (socket) => {
       acknowledge?.({ ok: true, message })
     } catch (error) { acknowledge?.({ ok: false, error: error.message }) }
   })
-  socket.on('chat:read', async ({ chatId }) => {
+  socket.on('chat:read', async ({ chatId, unlockToken: token }) => {
     try {
       await ensureChatMember(chatId, userId)
+      await requireChatAccess(chatId, userId, token)
       await query(`INSERT INTO message_receipts (message_id, user_id, delivered_at, read_at) SELECT id, $2, NOW(), NOW() FROM messages WHERE chat_id = $1 AND sender_id <> $2 ON CONFLICT (message_id, user_id) DO UPDATE SET read_at = NOW()`, [chatId, userId])
       io.to(roomFor(chatId)).emit('chat:read', { chatId, userId })
     } catch { /* Ignore unauthorized events. */ }
   })
-  socket.on('call:request', async ({ chatId, callId, type }, acknowledge) => {
+  socket.on('call:request', async ({ chatId, callId, type, unlockToken: token }, acknowledge) => {
     try {
       const chat = await ensureChatMember(chatId, userId)
+      await requireChatAccess(chatId, userId, token)
       if (chat.type === 'group') throw new Error('Calls are only available in one-to-one chats.')
       if (!callId || !['audio', 'video'].includes(type)) throw new Error('Unable to start this call.')
       const recipientId = chat.user_one_id === userId ? chat.user_two_id : chat.user_one_id

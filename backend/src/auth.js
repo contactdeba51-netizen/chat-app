@@ -1,15 +1,17 @@
 const crypto = require('node:crypto')
 const jwt = require('jsonwebtoken')
 const { query } = require('./db')
+const { jwtSecret } = require('./secrets')
 
-const JWT_SECRET = process.env.JWT_SECRET || 'replace-this-in-production'
-
+// Resolved per call so the secret module owns validation and fallbacks; a
+// production deployment without JWT_SECRET refuses to start rather than
+// signing sessions with a value published in this repository.
 function signAccessToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email, ver: Number(user.token_version) || 0 }, JWT_SECRET, { expiresIn: '7d' })
+  return jwt.sign({ sub: user.id, email: user.email, ver: Number(user.token_version) || 0 }, jwtSecret(), { expiresIn: '7d' })
 }
 
 function verifyAccessToken(token) {
-  return jwt.verify(token, JWT_SECRET)
+  return jwt.verify(token, jwtSecret())
 }
 
 function tokenFromRequest(request) {

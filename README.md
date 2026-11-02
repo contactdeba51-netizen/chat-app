@@ -250,6 +250,8 @@ TRUST_PROXY_HOPS=1
 
 `TRUST_PROXY_HOPS=1` lets Express read the real client IP from Render's proxy so per-IP limits work. `CLIENT_URL` must be the exact frontend origin, including scheme and no trailing slash.
 
+With `NODE_ENV=production` the API now refuses to start when `JWT_SECRET` or `MEDIA_SECRET` is missing, shorter than 32 characters, or when both hold the same value. The old behavior silently signed sessions and media links with a value committed to this repository. Development keeps a throwaway fallback so a fresh clone still runs.
+
 Deploy the frontend separately. On a **Render Static Site** use root directory `frontend`, build command `npm ci && npm run build`, and publish directory `dist`. Set its build variables before building:
 
 ```env

@@ -453,7 +453,7 @@ function ChatWorkspace({ session, authToken, onLogout, onSessionChange }) {
   }
 
   async function markSelectedRead() {
-    await Promise.all([...selectedChatIds].map((id) => apiFetch(`/chats/${id}/read`, { method: 'POST', credentials: 'include' }).catch(() => {})))
+    await Promise.all([...selectedChatIds].map((id) => apiFetch(`/chats/${id}/read`, { method: 'POST', credentials: 'include', headers: unlockTokens[id] ? { 'x-chat-unlock': unlockTokens[id] } : {} }).catch(() => {})))
     setChats((current) => current.map((chat) => selectedChatIds.has(chat.id) ? { ...chat, unread: 0 } : chat))
     leaveSelectionMode()
   }
@@ -489,7 +489,7 @@ function ChatWorkspace({ session, authToken, onLogout, onSessionChange }) {
   async function markAllRead() {
     setChats((current) => current.map((chat) => ({ ...chat, unread: 0 })))
     setHomeMenuOpen(false)
-    try { await Promise.all(chats.map((chat) => apiFetch(`/chats/${chat.id}/read`, { method: 'POST', credentials: 'include' }))) } catch { /* Local preview already updated. */ }
+    try { await Promise.all(chats.map((chat) => apiFetch(`/chats/${chat.id}/read`, { method: 'POST', credentials: 'include', headers: unlockTokens[chat.id] ? { 'x-chat-unlock': unlockTokens[chat.id] } : {} }))) } catch { /* Local preview already updated. */ }
   }
 
   function openNewChat() {
@@ -524,9 +524,11 @@ function ChatWorkspace({ session, authToken, onLogout, onSessionChange }) {
   async function selectChat(id) {
     if (selectionMode) return toggleSelectedChat(id)
     const target = chats.find((chat) => chat.id === id)
+    let unlockToken = unlockTokens[id]
     if (target?.locked) {
-      const token = unlockTokens[id] || await requestUnlock(id)
+      const token = unlockToken || await requestUnlock(id)
       if (!token) return
+      unlockToken = token
       if (!target.messages.length) await loadChatMessages(id, token)
       socketRef.current?.emit('chat:join', { chatId: id, unlockToken: token })
     }
@@ -538,7 +540,7 @@ function ChatWorkspace({ session, authToken, onLogout, onSessionChange }) {
     setActiveId(id); setMobileOpen(true); setPickerOpen(false)
     setContactMenuOpen(false)
     setChats((current) => current.map((chat) => chat.id === id ? { ...chat, unread: 0 } : chat))
-    apiFetch(`/chats/${id}/read`, { method: 'POST', credentials: 'include' }).catch(() => {})
+    apiFetch(`/chats/${id}/read`, { method: 'POST', credentials: 'include', headers: unlockToken ? { 'x-chat-unlock': unlockToken } : {} }).catch(() => {})
   }
 
   async function sendContent({ text = '', image = '', sticker = '' }) {
@@ -691,7 +693,7 @@ function ChatWorkspace({ session, authToken, onLogout, onSessionChange }) {
       callRef.current = { callId, type, role: 'caller', targetSocketId: null, chatId: targetChat.id }
       setCall({ type, status: 'Calling…', contact: targetChat.name })
       setCallHistory((current) => [{ id: callId, contact: targetChat.name, type, direction: 'Outgoing', time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }, ...current])
-      socketRef.current.timeout(8000).emit('call:request', { chatId: targetChat.id, callId, type }, (error, result) => {
+      socketRef.current.timeout(8000).emit('call:request', { chatId: targetChat.id, callId, type, unlockToken: unlockTokens[targetChat.id] }, (error, result) => {
         if (!error && result?.ok) return
         if (callRef.current?.callId !== callId) return
         socketRef.current?.emit('call:end', { callId })
