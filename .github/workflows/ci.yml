@@ -1,0 +1,201 @@
+name: CI
+
+# Runs on every push to main, every pull request, and on demand. Stage 1 has no
+# deploy job: it only verifies the code. Production deployment is added in a
+# later stage and gated behind this job.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      # A disposable database for this run only. It is never reachable from the
+      # internet and holds no production data.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: chat_app_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d chat_app_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # Hard-coded on purpose: tests cannot be pointed at Neon or Render even if
+      # a repository variable is changed by mistake.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chat_app_ci
+      DIRECT_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/chat_app_ci
+      DATABASE_SSL: "false"
+      NODE_ENV: test
+      # Throwaway values, valid only inside this job. They are distinct because
+      # the production guard refuses a shared JWT/media secret.
+      JWT_SECRET: ci-only-jwt-secret-0123456789abcdef0123456789abcdef
+      MEDIA_SECRET: ci-only-media-secret-0123456789abcdef0123456789abcdef
+      MEDIA_DRIVER: local
+      CLIENT_URL: http://localhost:5173
+      # Smoke, security, and browser tests all authenticate from one runner IP.
+      LOGIN_RATE_LIMIT: "2000"
+      CODE_RATE_LIMIT: "1000"
+      UPLOAD_RATE_LIMIT: "200"
+      UPLOAD_IP_RATE_LIMIT: "400"
+
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Refuse any non-local test database
+        run: |
+          node - <<'NODE'
+          for (const name of ['DATABASE_URL', 'DIRECT_DATABASE_URL']) {
+            const url = new URL(process.env[name])
+            const local = ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+            const expectedDatabase = url.pathname === '/chat_app_ci'
+            if (!local || !expectedDatabase) {
+              console.error(`Refusing to run: ${name} points at ${url.hostname}${url.pathname}, not the disposable local test database.`)
+              process.exit(1)
+            }
+            console.log(`${name}: ${url.hostname}${url.pathname}`)
+          }
+          NODE
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Backend JavaScript syntax checks
+        id: syntax
+        working-directory: backend
+        run: |
+          find src scripts -name '*.js' -print0 | xargs -0 -n1 node --check
+          echo "Checked $(find src scripts -name '*.js' | wc -l) files."
+
+      - name: Apply database migrations
+        id: migrate
+        working-directory: backend
+        run: npm run db:migrate
+
+      - name: Assert no migrations are pending
+        id: migrations
+        working-directory: backend
+        run: |
+          npm run db:status | tee /tmp/db-status.txt
+          grep -q '0 pending' /tmp/db-status.txt
+          echo "Schema is fully migrated."
+
+      - name: Start the API and wait for health
+        id: backend
+        working-directory: backend
+        run: |
+          npm start > /tmp/backend.log 2>&1 &
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://localhost:5000/healthz > /dev/null; then
+              echo "API ready after ${attempt}s."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "The API did not become healthy."
+          tail -n 120 /tmp/backend.log
+          exit 1
+
+      - name: Smoke tests
+        id: smoke
+        working-directory: backend
+        run: npm run smoke
+
+      - name: Security regression tests
+        id: security
+        working-directory: backend
+        run: npm run security:check
+
+      - name: Production frontend build
+        id: build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright end-to-end tests
+        id: e2e
+        working-directory: frontend
+        run: npm run test:e2e
+
+      - name: Upload Playwright traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-${{ github.run_attempt }}
+          path: |
+            frontend/test-results
+            frontend/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Show API log on failure
+        if: failure()
+        run: tail -n 200 /tmp/backend.log || true
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          {
+            echo "## CI result: ${{ job.status }}"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Backend syntax | ${{ steps.syntax.outcome }} |"
+            echo "| Migrations applied | ${{ steps.migrate.outcome }} |"
+            echo "| No pending migrations | ${{ steps.migrations.outcome }} |"
+            echo "| API health | ${{ steps.backend.outcome }} |"
+            echo "| Smoke tests (109) | ${{ steps.smoke.outcome }} |"
+            echo "| Security tests (29) | ${{ steps.security.outcome }} |"
+            echo "| Frontend build | ${{ steps.build.outcome }} |"
+            echo "| Playwright tests (9) | ${{ steps.e2e.outcome }} |"
+            echo ""
+            echo "Commit: \`$GITHUB_SHA\`"
+            echo "Database: disposable PostgreSQL 17 container on \`localhost\` (no production credentials)."
+          } >> "$GITHUB_STEP_SUMMARY"

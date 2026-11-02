@@ -1,9 +1,10 @@
 import { defineConfig } from '@playwright/test'
 
-// Uses the system Chrome because the downloaded Chromium bundles are large and
-// may be blocked on some networks. Install Chrome, or run
-// `npx playwright install chrome` once, then `npm run test:e2e`.
-const channel = process.env.PLAYWRIGHT_CHANNEL || 'chrome'
+// Uses the system Chrome locally because the downloaded Chromium bundles are
+// large and may be blocked on some networks. CI installs the pinned Chromium and
+// leaves the channel unset. Install Chrome, or set PLAYWRIGHT_CHANNEL (chrome,
+// msedge, or chromium) explicitly.
+const channel = process.env.PLAYWRIGHT_CHANNEL ?? (process.env.CI ? '' : 'chrome')
 
 export default defineConfig({
   testDir: './tests/e2e',
@@ -17,7 +18,7 @@ export default defineConfig({
   reporter: [['list']],
   use: {
     baseURL: 'http://localhost:5173',
-    channel,
+    ...(channel ? { channel } : {}),
     headless: true,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
