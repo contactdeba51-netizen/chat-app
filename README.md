@@ -116,6 +116,37 @@ npm run smoke
 
 The smoke test seeds verified accounts directly in PostgreSQL (sign-up itself needs a real email provider), then checks phone/email login, contacts, the "existing contacts only" privacy rule, pending invites, invite delivery, messaging, unread counts, receipts, editing, reactions, stars, replies, search, archiving, blocking, deletion, upload validation, signed and expiring media URLs, locked-chat PIN enforcement, status visibility, the newest-100 message window with its older-history cursor, group creation and membership, group messaging/receipts/replies/reactions, non-member rejection, and logout. Test rows are removed at the end.
 
+### Security regression check
+
+`npm run security:check` exercises authorization the way an attacker would: it seeds throwaway accounts, mints their own tokens, and connects to Socket.IO with each token separately from REST, so a REST-only fix cannot hide a broken handshake.
+
+```powershell
+cd "C:\Users\Debanjan\Chat App\backend"
+
+# Local API
+npm run security:check
+
+# Deployed API (DATABASE_URL must point at the same database)
+$env:SECURITY_BASE_URL = "https://chat-app-api-ku3h.onrender.com"
+$env:DATABASE_URL = $env:DIRECT_DATABASE_URL
+npm run security:check
+```
+
+It covers missing/forged tokens, revoked `token_version` (the password-reset path) on both transports, outsider membership, and an exhaustive locked-chat bypass: reading, sending, editing, deleting, forwarding, reacting, read receipts, attachment uploads, `chat:join`, `chat:typing`, and `call:request`. It then verifies the correct PIN unlocks all of them and that no bypass attempt wrote a message or receipt. All rows are deleted afterwards.
+
+### Browser tests (Playwright)
+
+```powershell
+cd "C:\Users\Debanjan\Chat App\frontend"
+npm run test:e2e           # headless, 9 tests
+npm run test:e2e:headed    # watch the browsers
+```
+
+Playwright starts Vite and the backend itself, reusing anything already listening on 5173/5000, seeds two verified accounts directly in the development database, and deletes them at the end. The suite signs in through the real form in two isolated browser contexts and checks: a live two-way message exchange with distinct per-tab tokens, staying signed in after a reload, the mobile layout and composer, an audio call, a video call with real frames (`videoWidth > 0` on both sides), and three cold-start retries (proxy 503, network failure, and a login retry).
+
+The config defaults to the installed Google Chrome (`channel: 'chrome'`) because the Playwright browser CDN is blocked on some networks. Install Chrome, or run `npx playwright install chromium` once and start with `PLAYWRIGHT_CHANNEL=chromium`. Edge works with `PLAYWRIGHT_CHANNEL=msedge`. Calls need no real camera: the suite launches with Chrome's fake media devices.
+
+
 ## 7. Production deployment (Neon + object storage + Render)
 
 Production uses three managed pieces, all with free tiers:
@@ -261,6 +292,25 @@ VITE_SOCKET_URL=https://your-api.onrender.com
 
 `VITE_*` values are compiled into the bundle, so change them and redeploy the frontend whenever the backend URL changes.
 
+#### Security headers on the static site
+
+Render static sites ignore `_headers` files, so the browser security headers are **Render header rules**, not files in this repository. They are configured per service (`POST /v1/services/{id}/headers` with `{ path, name, value }`) and apply to `/`:
+
+| Header | Value |
+| --- | --- |
+| `Content-Security-Policy` | `default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://your-api.onrender.com; media-src 'self' blob: https://your-api.onrender.com; connect-src 'self' https://your-api.onrender.com wss://your-api.onrender.com; font-src 'self'; manifest-src 'self'; worker-src 'self' blob:` |
+| `Permissions-Policy` | `camera=(self), microphone=(self), geolocation=(), payment=(), usb=()` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `X-Frame-Options` | `DENY` |
+| `Cross-Origin-Opener-Policy` | `same-origin` |
+
+`script-src 'self'` works because the build emits no inline scripts; `style-src` needs `'unsafe-inline'` for React's inline style attributes. Calls need `camera=(self)` and `microphone=(self)`, so keep those in the policy. **If the API host ever changes, update `img-src`, `media-src`, and `connect-src`** — `connect-src` needs both the `https://` and `wss://` forms or Socket.IO will be blocked. Verify with:
+
+```powershell
+(Invoke-WebRequest -UseBasicParsing "https://your-frontend.onrender.com").Headers["Content-Security-Policy"]
+```
+
+
 ### 7.4 Move the existing local data
 
 The portable PostgreSQL install has no `pg_dump`, so `scripts/copy-database.js` copies rows over the wire in foreign-key order. It is transactional, refuses a non-empty target unless `--truncate` is passed, and never overwrites conflicting keys.
@@ -350,11 +400,18 @@ Keep at least one copy outside the same storage account. A deleted object can be
 4. Sign in, open an old chat with a photo, and upload a new photo.
 5. Only then switch production traffic to the restored database.
 
+The no-`pg_dump` path is drilled the same way: create an empty scratch database, `npm run db:migrate`, then `SOURCE_DATABASE_URL=<prod> TARGET_DATABASE_URL=<scratch> npm run db:copy`, and compare `COUNT(*)` for every table plus a sample of message bodies. Migration `up` must run before the copy — the script refuses a target without a `users` table. Drop the scratch database afterwards. The last drill copied 71 rows across 8 tables with identical counts and message bodies.
+
+### Restart behavior
+
+A Render restart is not a health-check failure: the old instance keeps answering `/healthz` while the new one boots, then existing Socket.IO connections drop. In a measured restart, one signed-in socket disconnected 30.8 s after the request and reconnected 1.3 s later (32.1 s total) with authentication intact; `/healthz` never failed. The frontend shows a reconnect banner while the socket is down, and REST calls retry a cold API twice (after 2 s and 5 s) before giving up.
+
+
 ## 10. Free-tier notes
 
 - **Neon Free** gives 100 CU-hours of compute, 1 GB of Postgres storage, and **5 GB/month of network transfer shared across Postgres and Object Storage**. Running out of transfer suspends compute until the next billing period, and compute suspends after 5 minutes idle anyway. Keep the uptime ping on `/healthz` so it does not wake the database.
 - **Neon Object Storage Free** includes **5 GB per project**, in the same region as the database. Media quotas (section 8) cap each account long before that. Egress counts against the 5 GB shared transfer allowance; exceed it and the project's compute suspends rather than billing you.
-- **Render Free** gives 512 MB RAM and spins the service down after about 15 minutes without traffic, so the first request can take 30–60 seconds. Point a free uptime monitor (UptimeRobot, cron-job.org, or a GitHub Actions schedule) at `https://your-api.onrender.com/healthz` every 10 minutes. That keeps the instance warm without keeping Postgres awake. If cold starts are unacceptable, the Render Starter plan ($7/month) removes the spin-down.
+- **Render Free** gives 512 MB RAM and spins the service down after about 15 minutes without traffic, so the first request can take 30–60 seconds. Point a free uptime monitor (UptimeRobot, cron-job.org, or a GitHub Actions schedule) at `https://your-api.onrender.com/healthz` every 10 minutes. That keeps the instance warm without keeping Postgres awake. If cold starts are unacceptable, the Render Starter plan ($7/month) removes the spin-down. Even without a monitor, the app recovers by itself: `/auth/me` and login retry after 2 s and 5 s and show "Waking the chat server…" instead of stranding the user on a login screen. A 40-socket load check (960 messages across 20 chats) held ~100 MB RSS with p95 latency of 115 ms and no dropped connections, so the 512 MB cap leaves room for personal use.
 - Brevo Free sends about 300 emails per day, enough for sign-up codes and password resets.
 - Uploads are processed one image at a time (`sharp.concurrency(1)`) to stay inside 512 MB.
 
@@ -389,7 +446,7 @@ Keep at least one copy outside the same storage account. A deleted object can be
 - Passwords are hashed with bcrypt; verification codes are stored as HMAC hashes, expire in 10 minutes, and allow five attempts.
 - Phone numbers are **not verified by SMS** (no SMS budget). Account protection comes from the verified email; someone could still claim a phone number they do not own.
 - An account whose email is inaccessible and whose password is lost cannot be recovered.
-- API and Socket.IO connections require an authenticated session. The browser sends a per-tab bearer token, so tabs signed in as different accounts never share a session.
+- API and Socket.IO connections require an authenticated session. The browser sends a per-tab bearer token, so tabs signed in as different accounts never share a session. Socket.IO re-verifies the token (and its `token_version`) on every handshake rather than trusting the cookie or a previous REST check.
 - Presence and last-seen updates are only sent to saved contacts, direct-chat partners, and group co-members, and are suppressed when the user has hidden them.
 - Status updates are visible only to their author, saved contacts, and chat partners; blocked users are excluded.
 - Authorization checks protect chat membership, group membership, message editing, blocking, and reporting. Groups can only be created with saved contacts or existing chat partners, and group calls are rejected server-side.
@@ -397,7 +454,7 @@ Keep at least one copy outside the same storage account. A deleted object can be
 - Media is never publicly mounted. Each avatar, chat photo, and status image is served through a signed, expiring `/api/media/...` URL (7 days by default); object-storage reads are a presigned redirect behind it, re-validated on every request. Chat photos must be uploaded before they can be attached, and only the uploader (or a chat that already contains the file) can attach it.
 - Login, sign-up, code entry, and password-reset endpoints are rate limited. Sending messages, uploading media, and posting statuses are additionally limited per account (90 messages/minute over REST, 60/minute over Socket.IO, 40 uploads/hour, 10 statuses/day), with a separate upload budget per IP. IPv6 addresses are keyed by subnet so limits cannot be bypassed by rotating addresses.
 - Password-reset requests bump a per-account token version, so every session issued before the reset stops working immediately.
-- A locked chat keeps a bcrypt-hashed PIN on the server. Messages, previews, search results, uploads, and writes stay hidden until `POST /api/chats/:chatId/unlock` returns a 15-minute signed token; the PIN is never stored in the browser.
+- A locked chat keeps a bcrypt-hashed PIN on the server. Messages, previews, search results, uploads, and writes stay hidden until `POST /api/chats/:chatId/unlock` returns a 15-minute signed token; the PIN is never stored in the browser. The check runs on every REST route and Socket.IO event that can touch the chat — including `chat:join`, `chat:typing`, `message:send`, and `call:request` — and the regression suite proves each one is refused without a token. Failed PIN attempts are throttled in PostgreSQL (10 per 15 minutes per account and chat), so a restart or a second instance cannot reset the counter.
 - Account deletion removes the user, their chats, and the media files they own; expired statuses are cleaned up hourly.
 - Call history is stored per account so missed, declined, and completed calls survive a reload.
 - Message content is stored unencrypted in PostgreSQL; production end-to-end encryption is not implemented yet.

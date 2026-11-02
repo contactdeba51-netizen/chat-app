@@ -11,6 +11,11 @@ dist/
 backend/uploads/
 backups/
 
+# Playwright
+frontend/test-results/
+frontend/playwright-report/
+frontend/tests/e2e/.users.json
+
 # Editor/OS noise
 .DS_Store
 Thumbs.db

@@ -15,6 +15,7 @@
     "media:verify": "node scripts/verify-media.js",
     "storage:test": "node scripts/test-storage.js",
     "smoke": "node scripts/smoke-test.js",
+    "security:check": "node scripts/security-check.js",
     "mail:test": "node scripts/test-mail.js"
   },
   "keywords": [],

@@ -18,6 +18,30 @@ function apiFetch(path, options = {}) {
   if (token) headers.Authorization = `Bearer ${token}`
   return fetch(`${API_URL}${path.startsWith('/') ? path : `/${path}`}`, { credentials: 'include', ...options, headers })
 }
+
+// Render's free tier stops the API after a period without traffic, so the first
+// request of the day can fail before the instance wakes up: fetch itself throws a
+// TypeError, or Render's proxy answers 502/503/504. Retry only those cases, and
+// only for calls that are safe to repeat. A real HTTP error (401, 422) is
+// returned immediately so the UI keeps showing the server's message.
+const WAKE_RETRY_DELAYS_MS = [2000, 5000]
+
+async function apiFetchWithWakeRetry(path, options = {}, onRetry) {
+  for (let attempt = 0; ; attempt += 1) {
+    let response
+    try {
+      response = await apiFetch(path, options)
+    } catch (error) {
+      if (!(error instanceof TypeError) || attempt >= WAKE_RETRY_DELAYS_MS.length) throw error
+      onRetry?.(attempt)
+      await new Promise((resolve) => setTimeout(resolve, WAKE_RETRY_DELAYS_MS[attempt]))
+      continue
+    }
+    if (![502, 503, 504].includes(response.status) || attempt >= WAKE_RETRY_DELAYS_MS.length) return response
+    onRetry?.(attempt)
+    await new Promise((resolve) => setTimeout(resolve, WAKE_RETRY_DELAYS_MS[attempt]))
+  }
+}
 const emojiChoices = ['😀', '😂', '😍', '🥳', '👍', '❤️', '🔥', '🙏', '😢', '🎉', '🤔', '✨']
 const stickerChoices = ['😂', '❤️', '👍', '🔥', '🥳', '😎']
 const regionNames = new Intl.DisplayNames(['en'], { type: 'region' })
@@ -790,8 +814,11 @@ function AuthScreen({ onAuthenticated }) {
     return () => clearTimeout(timer)
   }, [resendIn])
 
-  async function post(path, body) {
-    const response = await apiFetch(`${path}`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  async function post(path, body, { retry = false } = {}) {
+    const options = { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    const response = retry
+      ? await apiFetchWithWakeRetry(path, options, () => setNotice('The chat server is waking up. Retrying…'))
+      : await apiFetch(path, options)
     const data = await response.json().catch(() => ({}))
     if (!response.ok) throw new Error(data.error || 'Unable to continue.')
     return data
@@ -802,7 +829,7 @@ function AuthScreen({ onAuthenticated }) {
     setError(''); setNotice(''); setBusy(true)
     try {
       if (mode === 'login') {
-        onAuthenticated(await post('/auth/login', loginWith === 'phone' ? { identifier: phone, country, password } : { identifier: email, password }))
+        onAuthenticated(await post('/auth/login', loginWith === 'phone' ? { identifier: phone, country, password } : { identifier: email, password }, { retry: true }))
       } else if (mode === 'register') {
         const data = await post('/auth/register/start', { country, phone, displayName, email, password })
         setPending(data); setCode(''); setResendIn(60); setMode('verify')
@@ -815,7 +842,7 @@ function AuthScreen({ onAuthenticated }) {
         onAuthenticated(await post('/auth/reset-password', { token: resetToken, password }))
       }
     } catch (requestError) {
-      setError(requestError instanceof TypeError ? `Cannot reach the chat server at ${SERVER_URL}. Check that the backend is running and that this page was opened from an allowed address.` : requestError.message)
+      setError(requestError instanceof TypeError ? `The chat server at ${SERVER_URL} did not answer. It may be starting up — wait about 30 seconds and try again.` : requestError.message)
     } finally { setBusy(false) }
   }
 
@@ -1136,11 +1163,20 @@ function App() {
   const [session, setSession] = useState(null)
   const [authToken, setAuthToken] = useState(() => sessionToken())
   const [checkingSession, setCheckingSession] = useState(true)
+  const [waking, setWaking] = useState(false)
   useEffect(() => {
     // The old build shared one token through localStorage; drop it so tabs stop
     // inheriting each other's account.
     try { localStorage.removeItem(SESSION_KEY) } catch { /* Storage can be unavailable. */ }
-    apiFetch('/auth/me').then(async (response) => response.ok ? response.json() : null).then((data) => data && setSession(data)).finally(() => setCheckingSession(false))
+    let cancelled = false
+    // A cold Render instance can fail the very first request; retry it so the
+    // user lands on their chats instead of a login screen they cannot use.
+    apiFetchWithWakeRetry('/auth/me', {}, () => { if (!cancelled) setWaking(true) })
+      .then(async (response) => response.ok ? response.json() : null)
+      .then((data) => { if (!cancelled && data) setSession(data) })
+      .catch(() => { /* Offline: show the login screen instead of hanging. */ })
+      .finally(() => { if (!cancelled) { setCheckingSession(false); setWaking(false) } })
+    return () => { cancelled = true }
   }, [authToken])
   function authenticated(data) {
     if (data.token) { try { sessionStorage.setItem(SESSION_KEY, data.token) } catch { /* Keep the in-memory session. */ } setAuthToken(data.token) }
@@ -1153,7 +1189,7 @@ function App() {
     setAuthToken('')
     setSession(null)
   }
-  if (checkingSession) return <main className="auth-page"><p className="session-loading">Loading Chat App…</p></main>
+  if (checkingSession) return <main className="auth-page"><p className="session-loading">{waking ? 'Waking the chat server…' : 'Loading Chat App…'}</p></main>
   return session ? <ChatWorkspace session={session} authToken={authToken} onLogout={logout} onSessionChange={setSession} /> : <AuthScreen onAuthenticated={authenticated} />
 }
 
