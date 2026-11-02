@@ -1,26 +1,33 @@
 name: CI
 
-# Runs on every push to main, every pull request, and on demand. Stage 1 has no
-# deploy job: it only verifies the code. Production deployment is added in a
-# later stage and gated behind this job.
+# Runs on every push to main, every pull request, and on demand. The deploy job
+# only runs for an explicit workflow_dispatch at this stage; pushes and pull
+# requests verify the code and stop there.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character SHA of a commit that already passed CI
+        required: true
+        type: string
 
 permissions:
   contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   verify:
     name: Verify
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
+    # Verify runs may cancel each other for the same ref. The deploy job below
+    # has its own group so a new push can never cancel a production deploy.
+    concurrency:
+      group: ci-verify-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
 
     services:
       # A disposable database for this run only. It is never reachable from the
@@ -198,4 +205,316 @@ jobs:
             echo ""
             echo "Commit: \`$GITHUB_SHA\`"
             echo "Database: disposable PostgreSQL 17 container on \`localhost\` (no production credentials)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Render
+    # Ordinary pushes and pull requests never deploy. Only an explicit dispatch
+    # reaches this job, and only after the verify job has passed.
+    if: github.event_name == 'workflow_dispatch'
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+
+    # One production deployment at a time: a second dispatch waits instead of
+    # cancelling or racing the running one.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      TARGET_COMMIT: ${{ inputs.commit }}
+      RENDER_API_SERVICE_ID: srv-dbjl9lc9v7es73aeeqs0
+      RENDER_WEB_SERVICE_ID: srv-dbjla58u01pc73fqe5kg
+      RENDER_API_BASE: https://api.render.com/v1
+
+    steps:
+      - name: Require the Render credential
+        id: credential
+        run: |
+          if [ -z "${RENDER_API_KEY:-}" ]; then
+            echo "::error::The RENDER_API_KEY repository secret is not set. Add it under Settings -> Secrets and variables -> Actions -> New repository secret, then dispatch this workflow again."
+            exit 1
+          fi
+          echo "Render credential is present."
+
+      - name: Check out the workflow commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the requested commit passed CI
+        id: commit
+        run: |
+          set -euo pipefail
+          if ! [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The commit input must be the full 40-character lowercase SHA."
+            exit 1
+          fi
+          if ! git cat-file -e "${TARGET_COMMIT}^{commit}" 2>/dev/null; then
+            echo "::error::Commit $TARGET_COMMIT does not exist in this repository."
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet origin/main >/dev/null; then
+            echo "::error::origin/main is not available in the checkout."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$TARGET_COMMIT" origin/main; then
+            echo "::error::Commit $TARGET_COMMIT is not reachable from main."
+            exit 1
+          fi
+          echo "Commit $TARGET_COMMIT is reachable from main."
+
+          runs=$(curl -sS --retry 3 --retry-delay 3 --max-time 30 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$TARGET_COMMIT&per_page=50")
+          passing=$(printf '%s' "$runs" | jq --arg sha "$TARGET_COMMIT" \
+            '[.workflow_runs[] | select(.head_sha == $sha and .event == "push" and .head_branch == "main" and .path == ".github/workflows/ci.yml" and .conclusion == "success")] | length')
+          if [ "${passing:-0}" -lt 1 ]; then
+            echo "::error::No successful CI run on main was found for $TARGET_COMMIT. Refusing to deploy."
+            exit 1
+          fi
+          echo "Commit $TARGET_COMMIT has a successful CI run on main."
+
+      - name: Install Render helpers
+        run: |
+          cat > "$RUNNER_TEMP/render.sh" <<'RENDER_HELPERS'
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+
+          render_get() {
+            local path="$1" attempt body status
+            for attempt in 1 2 3; do
+              body=$(curl -sS --max-time 30 \
+                -H "Authorization: Bearer $RENDER_API_KEY" \
+                -H "Accept: application/json" \
+                -w $'\n%{http_code}' \
+                "$RENDER_API_BASE$path" || true)
+              status="${body##*$'\n'}"
+              body="${body%$'\n'*}"
+              if [ "$status" = "200" ]; then
+                printf '%s' "$body"
+                return 0
+              fi
+              echo "Render GET $path returned HTTP ${status:-unknown}; retrying." >&2
+              sleep 5
+            done
+            echo "::error::Render GET $path failed after 3 attempts."
+            return 1
+          }
+
+          is_terminal_status() {
+            case "$1" in
+              live|deactivated|canceled|build_failed|update_failed|pre_deploy_failed) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          wait_for_idle() {
+            local id="$1" name="$2" attempt body active
+            for attempt in $(seq 1 120); do
+              body=$(render_get "/services/$id/deploys?limit=10") || return 1
+              active=$(printf '%s' "$body" | jq '[ .[] | (.deploy // .) | select(((.status) | IN("live","deactivated","canceled","build_failed","update_failed","pre_deploy_failed")) | not) ] | length')
+              if [ "${active:-1}" -eq 0 ]; then
+                echo "$name has no active deployments."
+                return 0
+              fi
+              echo "$name still has $active active deployment(s); waiting."
+              sleep 10
+            done
+            echo "::error::$name still had active deployments after 20 minutes."
+            return 1
+          }
+
+          trigger_deploy() {
+            local id="$1" name="$2" body status
+            body=$(curl -sS --max-time 30 -X POST \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              -d "{\"commitId\":\"$TARGET_COMMIT\"}" \
+              -w $'\n%{http_code}' \
+              "$RENDER_API_BASE/services/$id/deploys" || true)
+            status="${body##*$'\n'}"
+            body="${body%$'\n'*}"
+            printf '%s' "$status" > "$RUNNER_TEMP/trigger-$id.status"
+            printf '%s' "$body" > "$RUNNER_TEMP/trigger-$id.json"
+            echo "$name deploy request returned HTTP ${status:-unknown}."
+          }
+
+          poll_deploy() {
+            local id="$1" name="$2" deploy_id="$3" attempt body status commit
+            for attempt in $(seq 1 120); do
+              body=$(render_get "/services/$id/deploys/$deploy_id") || return 1
+              status=$(printf '%s' "$body" | jq -r '(.deploy // .) | .status')
+              commit=$(printf '%s' "$body" | jq -r '(.deploy // .) | .commit.id')
+              if [ "$commit" != "$TARGET_COMMIT" ]; then
+                echo "::error::$name deployment $deploy_id references commit $commit, not $TARGET_COMMIT."
+                return 1
+              fi
+              if [ "$status" = "live" ]; then
+                echo "$name deployment $deploy_id is live."
+                return 0
+              fi
+              if is_terminal_status "$status"; then
+                echo "::error::$name deployment $deploy_id ended as $status."
+                return 1
+              fi
+              sleep 10
+            done
+            echo "::error::$name deployment $deploy_id did not reach live within 20 minutes (last status: ${status:-unknown})."
+            return 1
+          }
+          RENDER_HELPERS
+
+      - name: Verify Render services and wait for idle
+        id: preflight
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/render.sh"
+
+          for entry in "$RENDER_API_SERVICE_ID:chat-app-api:web_service" "$RENDER_WEB_SERVICE_ID:chat-app-web:static_site"; do
+            id="${entry%%:*}"
+            rest="${entry#*:}"
+            name="${rest%%:*}"
+            type="${rest#*:}"
+            service=$(render_get "/services/$id") || exit 1
+            actual_name=$(printf '%s' "$service" | jq -r '.name')
+            actual_type=$(printf '%s' "$service" | jq -r '.type')
+            if [ "$actual_name" != "$name" ] || [ "$actual_type" != "$type" ]; then
+              fail "Service $id is $actual_name ($actual_type), expected $name ($type)."
+            fi
+            echo "Verified $name ($type) as $id."
+          done
+
+          wait_for_idle "$RENDER_API_SERVICE_ID" "chat-app-api"
+          wait_for_idle "$RENDER_WEB_SERVICE_ID" "chat-app-web"
+
+      - name: Trigger deployments for the tested commit
+        id: trigger
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/render.sh"
+          started_at=$(date -u +%s)
+
+          trigger_deploy "$RENDER_API_SERVICE_ID" "chat-app-api"
+          trigger_deploy "$RENDER_WEB_SERVICE_ID" "chat-app-web"
+
+          resolve_deploy_id() {
+            local id="$1" name="$2" response status attempt body matches count
+            response="$RUNNER_TEMP/trigger-$id.json"
+            status=$(cat "$RUNNER_TEMP/trigger-$id.status" 2>/dev/null || true)
+
+            if [[ "$status" =~ ^2[0-9][0-9]$ ]] && jq -e '(.id // .deploy.id)' "$response" >/dev/null 2>&1; then
+              jq -r '(.id // .deploy.id)' "$response" > "$RUNNER_TEMP/deploy-id-$id"
+              echo "$name deployment created: $(cat "$RUNNER_TEMP/deploy-id-$id")"
+              return 0
+            fi
+
+            echo "$name trigger outcome is uncertain (HTTP ${status:-none}). Inspecting existing deployments instead of retrying."
+            for attempt in $(seq 1 6); do
+              body=$(render_get "/services/$id/deploys?limit=10") || return 1
+              matches=$(printf '%s' "$body" | jq -r --arg sha "$TARGET_COMMIT" --argjson since "$((started_at - 120))" \
+                '[ .[] | (.deploy // .) | select(.commit.id == $sha) | select(((.createdAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) >= $since) | .id ] | .[]')
+              count=$(printf '%s' "$matches" | grep -c . || true)
+              if [ "$count" -eq 1 ]; then
+                printf '%s' "$matches" > "$RUNNER_TEMP/deploy-id-$id"
+                echo "$name deployment found after uncertain trigger: $matches"
+                return 0
+              fi
+              if [ "$count" -gt 1 ]; then
+                fail "$name trigger was uncertain and $count matching deployments were found. Refusing to guess."
+              fi
+              sleep 10
+            done
+            fail "$name trigger was uncertain and no matching deployment appeared. Refusing to retry automatically."
+          }
+
+          resolve_deploy_id "$RENDER_API_SERVICE_ID" "chat-app-api"
+          resolve_deploy_id "$RENDER_WEB_SERVICE_ID" "chat-app-web"
+
+          echo "API_DEPLOY_ID=$(cat "$RUNNER_TEMP/deploy-id-$RENDER_API_SERVICE_ID")" >> "$GITHUB_ENV"
+          echo "WEB_DEPLOY_ID=$(cat "$RUNNER_TEMP/deploy-id-$RENDER_WEB_SERVICE_ID")" >> "$GITHUB_ENV"
+
+      - name: Wait for both deployments to go live
+        id: poll
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/render.sh"
+          poll_deploy "$RENDER_API_SERVICE_ID" "chat-app-api" "$API_DEPLOY_ID"
+          poll_deploy "$RENDER_WEB_SERVICE_ID" "chat-app-web" "$WEB_DEPLOY_ID"
+
+      - name: Verify production health
+        id: health
+        run: |
+          set -euo pipefail
+          api="https://chat-app-api-ku3h.onrender.com"
+          web="https://chat-app-web-ywez.onrender.com"
+
+          wait_for_200() {
+            local url="$1" attempt code
+            for attempt in $(seq 1 60); do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)
+              if [ "$code" = "200" ]; then
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::error::$url did not return 200 (last status: ${code:-none})."
+            return 1
+          }
+
+          healthz_ok=0
+          for attempt in $(seq 1 60); do
+            body=$(curl -sS --max-time 30 -w $'\n%{http_code}' "$api/healthz" || true)
+            code="${body##*$'\n'}"
+            json="${body%$'\n'*}"
+            if [ "$code" = "200" ] && printf '%s' "$json" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+              healthz_ok=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$healthz_ok" -eq 1 ] || fail "API /healthz did not return 200 with status ok."
+          echo "API /healthz is ok."
+
+          wait_for_200 "$api/readyz"
+          echo "API /readyz is 200."
+
+          wait_for_200 "$web/"
+          echo "Frontend root is 200."
+
+          headers=$(curl -sS -D - -o /dev/null --max-time 30 "$web/" || true)
+          printf '%s' "$headers" | grep -qi '^content-security-policy:' || fail "The frontend response has no Content-Security-Policy header."
+          printf '%s' "$headers" | grep -qi "default-src 'self'" || fail "The frontend CSP is missing default-src 'self'."
+          printf '%s' "$headers" | grep -qi "frame-ancestors 'none'" || fail "The frontend CSP is missing frame-ancestors 'none'."
+          echo "Frontend CSP is present and has the expected directives."
+
+      - name: Publish deployment summary
+        if: always()
+        run: |
+          {
+            echo "## Deployment result: ${{ job.status }}"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Target commit | \`$TARGET_COMMIT\` |"
+            echo "| API deployment | ${API_DEPLOY_ID:-not created} |"
+            echo "| Static site deployment | ${WEB_DEPLOY_ID:-not created} |"
+            echo "| Commit verification | ${{ steps.commit.outcome }} |"
+            echo "| Idle preflight | ${{ steps.preflight.outcome }} |"
+            echo "| Trigger | ${{ steps.trigger.outcome }} |"
+            echo "| Both live | ${{ steps.poll.outcome }} |"
+            echo "| Production health | ${{ steps.health.outcome }} |"
+            echo ""
+            echo "Triggered by an explicit workflow_dispatch; Render auto-deploy settings were not changed."
           } >> "$GITHUB_STEP_SUMMARY"
