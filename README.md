@@ -310,6 +310,24 @@ Render static sites ignore `_headers` files, so the browser security headers are
 (Invoke-WebRequest -UseBasicParsing "https://your-frontend.onrender.com").Headers["Content-Security-Policy"]
 ```
 
+#### Deployment CI and emergency recovery
+
+Git-triggered auto-deploy is **off** on both Render services (`autoDeployTrigger: "off"`). Pushing to `main` runs the CI workflow but does not deploy. Production is deployed only by the `deploy` job, and it accepts only the full SHA of a commit that already passed CI.
+
+- **Normal deployment:** dispatch **CI** with the tested SHA. The job confirms the SHA is on `main` with a successful CI run, waits for active Render deploys, triggers both services with that SHA, polls to `live`, checks each deployment record's commit, then verifies `/healthz`, `/readyz`, the frontend, and the CSP header.
+- **Emergency: temporarily abandon the CI route.** Re-enable Git-triggered deploys with Render's supported field, then deploy from the dashboard:
+
+  ```powershell
+  # RENDER_API_KEY comes from the environment; never commit it.
+  $body = '{"autoDeployTrigger":"commit"}'
+  Invoke-RestMethod -Method Patch -Uri "https://api.render.com/v1/services/<service-id>" `
+    -Headers @{ Authorization = "Bearer $env:RENDER_API_KEY"; "Content-Type" = "application/json" } `
+    -Body $body
+  ```
+
+  Use `autoDeployTrigger: "commit"`; the `autoDeploy` field is deprecated. Set it back to `"off"` as soon as the CI route is usable again.
+- **Emergency manual deploy (break-glass).** A dashboard or API deploy is allowed only when Actions is unavailable or a fix cannot wait. Record the incident (who, when, commit, reason), deploy the exact commit, verify `/healthz`, `/readyz`, the frontend, and the CSP header, then dispatch CI for the same SHA so the normal gate and provenance are restored. Never deploy an untested SHA as a shortcut, and never roll back automatically.
+
 
 ### 7.4 Move the existing local data
 
