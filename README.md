@@ -312,9 +312,9 @@ Render static sites ignore `_headers` files, so the browser security headers are
 
 #### Deployment CI and emergency recovery
 
-Git-triggered auto-deploy is **off** on both Render services (`autoDeployTrigger: "off"`). Pushing to `main` runs the CI workflow but does not deploy. Production is deployed only by the `deploy` job, and it accepts only the full SHA of a commit that already passed CI.
+Git-triggered auto-deploy is **off** on both Render services (`autoDeployTrigger: "off"`). Production is deployed only by the `deploy` job in the CI workflow, and only for the exact commit that run verified on `main`. Pull requests never deploy.
 
-- **Normal deployment:** dispatch **CI** with the tested SHA. The job confirms the SHA is on `main` with a successful CI run, waits for active Render deploys, triggers both services with that SHA, polls to `live`, checks each deployment record's commit, then verifies `/healthz`, `/readyz`, the frontend, and the CSP header.
+- **Normal deployment:** push to `main`. CI verifies the pushed commit, then the deploy job triggers both services with that same SHA, waits for active Render deploys, polls to `live`, checks each deployment record's commit, and verifies `/healthz`, `/readyz`, the frontend, and the CSP header. Manual dispatch on `main` runs the same path without a push.
 - **Emergency: temporarily abandon the CI route.** Re-enable Git-triggered deploys with Render's supported field, then deploy from the dashboard:
 
   ```powershell
@@ -326,7 +326,7 @@ Git-triggered auto-deploy is **off** on both Render services (`autoDeployTrigger
   ```
 
   Use `autoDeployTrigger: "commit"`; the `autoDeploy` field is deprecated. Set it back to `"off"` as soon as the CI route is usable again.
-- **Emergency manual deploy (break-glass).** A dashboard or API deploy is allowed only when Actions is unavailable or a fix cannot wait. Record the incident (who, when, commit, reason), deploy the exact commit, verify `/healthz`, `/readyz`, the frontend, and the CSP header, then dispatch CI for the same SHA so the normal gate and provenance are restored. Never deploy an untested SHA as a shortcut, and never roll back automatically.
+- **Emergency manual deploy (break-glass).** A dashboard or API deploy is allowed only when Actions is unavailable or a fix cannot wait. Record the incident (who, when, commit, reason), deploy the exact commit, verify `/healthz`, `/readyz`, the frontend, and the CSP header, then run CI for the same commit so the normal gate and provenance are restored. Never deploy an untested SHA as a shortcut, and never roll back automatically.
 
 
 ### 7.4 Move the existing local data

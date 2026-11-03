@@ -1,18 +1,12 @@
 name: CI
 
-# Runs on every push to main, every pull request, and on demand. The deploy job
-# only runs for an explicit workflow_dispatch at this stage; pushes and pull
-# requests verify the code and stop there.
+# Runs on every push to main, every pull request, and on demand. Pushes to main
+# verify and then deploy the same commit. Pull requests only verify.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      commit:
-        description: Full 40-character SHA of a commit that already passed CI
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -209,17 +203,17 @@ jobs:
 
   deploy:
     name: Deploy to Render
-    # Ordinary pushes and pull requests never deploy. Only an explicit dispatch
-    # reaches this job, and only after the verify job has passed.
-    if: github.event_name == 'workflow_dispatch'
+    # Pushes to main deploy only after Verify succeeds. Pull requests never
+    # deploy. A manual dispatch on main remains available for the emergency
+    # path. The job deploys github.sha, the exact commit this run verified.
+    if: needs.verify.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: [verify]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
-      actions: read
 
-    # One production deployment at a time: a second dispatch waits instead of
+    # One production deployment at a time: a second deploy waits instead of
     # cancelling or racing the running one.
     concurrency:
       group: production-deploy
@@ -227,8 +221,7 @@ jobs:
 
     env:
       RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
-      GITHUB_TOKEN: ${{ github.token }}
-      TARGET_COMMIT: ${{ inputs.commit }}
+      TARGET_COMMIT: ${{ github.sha }}
       RENDER_API_SERVICE_ID: srv-dbjl9lc9v7es73aeeqs0
       RENDER_WEB_SERVICE_ID: srv-dbjla58u01pc73fqe5kg
       RENDER_API_BASE: https://api.render.com/v1
@@ -238,27 +231,28 @@ jobs:
         id: credential
         run: |
           if [ -z "${RENDER_API_KEY:-}" ]; then
-            echo "::error::The RENDER_API_KEY repository secret is not set. Add it under Settings -> Secrets and variables -> Actions -> New repository secret, then dispatch this workflow again."
+            echo "::error::The RENDER_API_KEY repository secret is not set. Add it under Settings -> Secrets and variables -> Actions -> New repository secret, then run this workflow again."
             exit 1
           fi
           echo "Render credential is present."
 
-      - name: Check out the workflow commit
+      - name: Check out the verified commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify the requested commit passed CI
+      - name: Verify the deployment commit
         id: commit
         run: |
           set -euo pipefail
-          if ! [[ "$TARGET_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::The commit input must be the full 40-character lowercase SHA."
+          if [ "$TARGET_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::Refusing to deploy $TARGET_COMMIT: this run verified $GITHUB_SHA."
             exit 1
           fi
-          if ! git cat-file -e "${TARGET_COMMIT}^{commit}" 2>/dev/null; then
-            echo "::error::Commit $TARGET_COMMIT does not exist in this repository."
+          checked_out=$(git rev-parse HEAD)
+          if [ "$checked_out" != "$TARGET_COMMIT" ]; then
+            echo "::error::Checked out $checked_out but expected $TARGET_COMMIT."
             exit 1
           fi
           if ! git rev-parse --verify --quiet origin/main >/dev/null; then
@@ -269,19 +263,7 @@ jobs:
             echo "::error::Commit $TARGET_COMMIT is not reachable from main."
             exit 1
           fi
-          echo "Commit $TARGET_COMMIT is reachable from main."
-
-          runs=$(curl -sS --retry 3 --retry-delay 3 --max-time 30 \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$TARGET_COMMIT&per_page=50")
-          passing=$(printf '%s' "$runs" | jq --arg sha "$TARGET_COMMIT" \
-            '[.workflow_runs[] | select(.head_sha == $sha and .event == "push" and .head_branch == "main" and .path == ".github/workflows/ci.yml" and .conclusion == "success")] | length')
-          if [ "${passing:-0}" -lt 1 ]; then
-            echo "::error::No successful CI run on main was found for $TARGET_COMMIT. Refusing to deploy."
-            exit 1
-          fi
-          echo "Commit $TARGET_COMMIT has a successful CI run on main."
+          echo "Verify passed for $TARGET_COMMIT in this run and the same commit is checked out."
 
       - name: Install Render helpers
         run: |
@@ -516,5 +498,5 @@ jobs:
             echo "| Both live | ${{ steps.poll.outcome }} |"
             echo "| Production health | ${{ steps.health.outcome }} |"
             echo ""
-            echo "Triggered by an explicit workflow_dispatch; Render auto-deploy settings were not changed."
+            echo "Deployed by GitHub Actions after Verify succeeded; Render auto-deploy remains off."
           } >> "$GITHUB_STEP_SUMMARY"
