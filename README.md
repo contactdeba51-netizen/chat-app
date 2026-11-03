@@ -2,6 +2,10 @@
 
 A WhatsApp-inspired real-time chat application built with React, Express, Socket.IO, and PostgreSQL.
 
+## Production operations
+
+CI/CD, Render configuration, emergency recovery, database and media backup status, security controls, monitoring, and the deployment checklist are documented in [docs/PRODUCTION_OPERATIONS.md](docs/PRODUCTION_OPERATIONS.md). The sections below cover local setup and day-to-day development.
+
 ## Requirements
 
 - Node.js 20+
