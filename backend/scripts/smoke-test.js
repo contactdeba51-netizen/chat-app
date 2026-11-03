@@ -399,6 +399,10 @@ async function main() {
     check('password reset returns a fresh session', reset.status === 200 && Boolean(reset.data.token), JSON.stringify(reset.data))
     check('pre-reset token is rejected', (await request('/auth/me', { token: staleToken })).status === 401)
     check('post-reset token works', (await request('/auth/me', { token: reset.data.token })).status === 200)
+
+    // Stage 5A drill: deliberately false so CI proves it blocks a deploy when
+    // verification fails. Remove after the drill; never merge to main.
+    check('stage5a deliberate failure drill', false, 'intentional failure for the CI deployment gate drill')
   } finally {
     await cleanup().catch((error) => console.error('Cleanup failed:', error.message))
     await db.end()
